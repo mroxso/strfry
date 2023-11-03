@@ -1,13 +1,21 @@
-#include "RelayServer.h"
+#pragma once
+
 #include "DBQuery.h"
 
 
+struct QueryScheduler : NonCopyable {
+    std::function<void(lmdb::txn &txn, const Subscription &sub, uint64_t levId, std::string_view eventPayload)> onEvent;
+    std::function<void(lmdb::txn &txn, const Subscription &sub, const std::vector<uint64_t> &levIds)> onEventBatch;
+    std::function<void(lmdb::txn &txn, Subscription &sub)> onComplete;
 
-struct ActiveQueries : NonCopyable {
-    Decompressor decomp;
+    // If false, then levIds returned to above callbacks can be stale (because they were deleted)
+    // If false, then onEvent's eventPayload will always be ""
+    bool ensureExists = true;
+
     using ConnQueries = flat_hash_map<SubId, DBQuery*>;
     flat_hash_map<uint64_t, ConnQueries> conns; // connId -> subId -> DBQuery*
     std::deque<DBQuery*> running;
+    std::vector<uint64_t> levIdBatch;
 
     bool addSub(lmdb::txn &txn, Subscription &&sub) {
         sub.latestEventId = getMostRecentLevId(txn);
@@ -59,7 +67,7 @@ struct ActiveQueries : NonCopyable {
         conns.erase(connId);
     }
 
-    void process(RelayServer *server, lmdb::txn &txn) {
+    void process(lmdb::txn &txn) {
         if (running.empty()) return;
 
         DBQuery *q = running.front();
@@ -70,17 +78,30 @@ struct ActiveQueries : NonCopyable {
             return;
         }
 
-        bool complete = q->process(txn, [&](const auto &sub, uint64_t levId, std::string_view eventPayload){
-            server->sendEvent(sub.connId, sub.subId, decodeEventPayload(txn, decomp, eventPayload, nullptr, nullptr));
+        auto eventPayloadCursor = lmdb::cursor::open(txn, env.dbi_EventPayload);
+
+        bool complete = q->process(txn, [&](const auto &sub, uint64_t levId){
+            std::string_view eventPayload;
+
+            if (ensureExists) {
+                std::string_view key = lmdb::to_sv<uint64_t>(levId);
+                if (!eventPayloadCursor.get(key, eventPayload, MDB_SET_KEY)) return; // If not found, was deleted while scan was paused
+            }
+
+            if (onEvent) onEvent(txn, sub, levId, eventPayload);
+            if (onEventBatch) levIdBatch.push_back(levId);
         }, cfg().relay__queryTimesliceBudgetMicroseconds, cfg().relay__logging__dbScanPerf);
+
+        if (onEventBatch) {
+            onEventBatch(txn, q->sub, levIdBatch);
+            levIdBatch.clear();
+        }
 
         if (complete) {
             auto connId = q->sub.connId;
-
-            server->sendToConn(connId, tao::json::to_string(tao::json::value::array({ "EOSE", q->sub.subId.str() })));
             removeSub(connId, q->sub.subId);
 
-            server->tpReqMonitor.dispatch(connId, MsgReqMonitor{MsgReqMonitor::NewSub{std::move(q->sub)}});
+            if (onComplete) onComplete(txn, q->sub);
 
             delete q;
         } else {
@@ -88,36 +109,3 @@ struct ActiveQueries : NonCopyable {
         }
     }
 };
-
-
-void RelayServer::runReqWorker(ThreadPool<MsgReqWorker>::Thread &thr) {
-    ActiveQueries queries;
-
-    while(1) {
-        auto newMsgs = queries.running.empty() ? thr.inbox.pop_all() : thr.inbox.pop_all_no_wait();
-
-        auto txn = env.txn_ro();
-
-        for (auto &newMsg : newMsgs) {
-            if (auto msg = std::get_if<MsgReqWorker::NewSub>(&newMsg.msg)) {
-                auto connId = msg->sub.connId;
-
-                if (!queries.addSub(txn, std::move(msg->sub))) {
-                    sendNoticeError(connId, std::string("too many concurrent REQs"));
-                }
-
-                queries.process(this, txn);
-            } else if (auto msg = std::get_if<MsgReqWorker::RemoveSub>(&newMsg.msg)) {
-                queries.removeSub(msg->connId, msg->subId);
-                tpReqMonitor.dispatch(msg->connId, MsgReqMonitor{MsgReqMonitor::RemoveSub{msg->connId, msg->subId}});
-            } else if (auto msg = std::get_if<MsgReqWorker::CloseConn>(&newMsg.msg)) {
-                queries.closeConn(msg->connId);
-                tpReqMonitor.dispatch(msg->connId, MsgReqMonitor{MsgReqMonitor::CloseConn{msg->connId}});
-            }
-        }
-
-        queries.process(this, txn);
-
-        txn.abort();
-    }
-}
