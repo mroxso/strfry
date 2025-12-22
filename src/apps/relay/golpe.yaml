@@ -27,11 +27,20 @@ config:
   - name: relay__info__contact
     desc: "NIP-11: Alternative administrative contact (email, website, etc)"
     default: ""
+  - name: relay__info__icon
+    desc: "NIP-11: URL pointing to an image to be used as an icon for the relay"
+    default: ""
+  - name: relay__info__nips
+    desc: "List of supported lists as JSON array, or empty string to use default. Example: \"[1,2]\""
+    default: ""
 
   - name: relay__maxWebsocketPayloadSize
     desc: "Maximum accepted incoming websocket frame size (should be larger than max event)"
     default: 131072
     noReload: true
+  - name: relay__maxReqFilterSize
+    desc: "Maximum number of filters allowed in a REQ"
+    default: 200
   - name: relay__autoPingSeconds
     desc: "Websocket-level PING message frequency (should be less than any reverse proxy idle timeouts)"
     default: 55

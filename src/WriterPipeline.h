@@ -9,8 +9,6 @@
 
 struct WriterPipelineInput {
     tao::json::value eventJson;
-    EventSourceType sourceType;
-    std::string sourceInfo;
 };
 
 
@@ -67,25 +65,30 @@ struct WriterPipeline {
                         return;
                     }
 
-                    std::string flatStr;
+                    std::string packedStr;
                     std::string jsonStr;
 
                     try {
-                        parseAndVerifyEvent(m.eventJson, secpCtx, verifyMsg, verifyTime, flatStr, jsonStr);
+                        parseAndVerifyEvent(m.eventJson, secpCtx, verifyMsg, verifyTime, packedStr, jsonStr);
                     } catch (std::exception &e) {
-                        if (verboseReject) LW << "Rejected event: " << m.eventJson << " reason: " << e.what();
+                        if (verboseReject) {
+                            jsonStr = tao::json::to_string(m.eventJson).substr(0,200);
+                            LW << "Rejected event: " << jsonStr << " reason: " << e.what();
+                        }
                         numLive--;
                         totalRejected++;
                         continue;
                     }
 
-                    writerInbox.push_move({ std::move(flatStr), std::move(jsonStr), hoytech::curr_time_us(), m.sourceType, std::move(m.sourceInfo) });
+                    writerInbox.push_move({ std::move(packedStr), std::move(jsonStr), });
                 }
             }
         });
 
         writerThread = std::thread([&]() {
             setThreadName("Writer");
+
+            NegentropyFilterCache neFilterCache;
 
             while (1) {
                 // Debounce
@@ -122,15 +125,15 @@ struct WriterPipeline {
                         auto event = std::move(newEvents.front());
                         newEvents.pop_front();
 
-                        if (event.flatStr.size() == 0) {
+                        if (event.packedStr.size() == 0) {
                             shutdownComplete = true;
                             break;
                         }
 
                         numLive--;
 
-                        auto *flat = flatStrToFlatEvent(event.flatStr);
-                        if (lookupEventById(txn, sv(flat->id()))) {
+                        PackedEventView packed(event.packedStr);
+                        if (lookupEventById(txn, packed.id())) {
                             dups++;
                             totalDups++;
                             continue;
@@ -143,7 +146,7 @@ struct WriterPipeline {
                 if (newEventsToProc.size()) {
                     {
                         auto txn = env.txn_rw();
-                        writeEvents(txn, newEventsToProc);
+                        writeEvents(txn, neFilterCache, newEventsToProc);
                         txn.commit();
                     }
 
@@ -186,8 +189,14 @@ struct WriterPipeline {
         validatorInbox.push_move(std::move(inp));
     }
 
+    void write(EventToWrite &&inp) {
+        totalProcessed++;
+        numLive++;
+        writerInbox.push_move(std::move(inp));
+    }
+
     void flush() {
-        validatorInbox.push_move({ tao::json::null, EventSourceType::None, "" });
+        validatorInbox.push_move({ tao::json::null, });
         flushInbox.wait();
     }
 
